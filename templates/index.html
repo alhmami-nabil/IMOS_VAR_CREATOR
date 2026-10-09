@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Variables</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<div class="app">
+  <!-- ============ LEFT : tree ============ -->
+  <aside class="left">
+    <div class="left-top">
+      <a class="brand" href="/" title="Tecnibo – Variables">
+        <span class="brand-logo" role="img" aria-label="Tecnibo"></span>
+      </a>
+      <span class="db-label" id="dbLabel"></span>
+      <input id="searchBox" class="search-box" type="text" placeholder="Search variables" hidden>
+      <button class="icon-btn" id="btnSearch" title="Search">
+        <svg viewBox="0 0 24 24"><circle cx="10" cy="10" r="6.5"/><line x1="15" y1="15" x2="21" y2="21"/></svg>
+      </button>
+      <button class="icon-btn" id="btnRefresh" title="Refresh">
+        <svg viewBox="0 0 24 24"><path d="M19 12a7 7 0 1 1-2.1-5"/><polyline points="18 3 18 8 13 8"/></svg>
+      </button>
+    </div>
+    <div class="db-pick">
+      <label for="dbSelect">Base de données</label>
+      <select id="dbSelect" title="Database on BXL-SQL-IMD"></select>
+    </div>
+    <h1 class="left-title">Variables</h1>
+    <div class="tree" id="tree" tabindex="0"></div>
+  </aside>
+
+  <!-- drag this border to make the tree wider or narrower (double-click = default width) -->
+  <div class="splitter" id="splitter" role="separator" aria-orientation="vertical"
+       aria-label="Resize the tree" tabindex="0" title="Drag to resize · double-click to reset"></div>
+
+  <!-- ============ RIGHT : toolbar + details ============ -->
+  <main class="right">
+    <div class="toolbar">
+      <button class="tb" id="tbSave" disabled>
+        <svg viewBox="0 0 32 32"><path d="M4 4h20l4 4v20H4z"/><rect x="9" y="4" width="12" height="8"/><rect x="8" y="17" width="16" height="11"/></svg>
+        <span>Save</span>
+      </button>
+      <div class="tb-sep"></div>
+      <button class="tb" id="tbNewVar" disabled>
+        <svg viewBox="0 0 32 32"><line x1="16" y1="3" x2="16" y2="29"/><line x1="3" y1="16" x2="29" y2="16"/></svg>
+        <span>New<br>Variable</span>
+      </button>
+      <button class="tb" id="tbNewFam" disabled>
+        <svg viewBox="0 0 32 32"><path d="M3 6h9l2 3h15v19H3z"/><circle cx="12" cy="17" r="3"/><circle cx="20" cy="17" r="3"/><circle cx="16" cy="23" r="3"/></svg>
+        <span>New<br>Family</span>
+      </button>
+      <button class="tb" id="tbRename" disabled>
+        <svg viewBox="0 0 32 32"><path d="M6 27 13 6h3l7 21"/><line x1="9" y1="19" x2="20" y2="19"/><path d="M18 26l9-13 3 2-9 13-4 1z"/></svg>
+        <span>Rename</span>
+      </button>
+      <button class="tb" id="tbMove" disabled>
+        <svg viewBox="0 0 32 32"><path d="M3 7h9l2 3h15v17H3z"/><path d="M10 18h11"/><path d="M17 14l4 4-4 4"/></svg>
+        <span>Move</span>
+      </button>
+      <button class="tb" id="tbDelete" disabled>
+        <svg viewBox="0 0 32 32"><line x1="4" y1="7" x2="28" y2="7"/><path d="M12 7V3h8v4"/><path d="M7 7l1.5 22h15L25 7"/><line x1="13" y1="12" x2="13" y2="25"/><line x1="16" y1="12" x2="16" y2="25"/><line x1="19" y1="12" x2="19" y2="25"/></svg>
+        <span>Delete</span>
+      </button>
+      <div class="tb-sep"></div>
+      <button class="tb" id="tbFeedback">
+        <svg viewBox="0 0 32 32"><path d="M16 4C9 4 3 8.5 3 15c0 3 1.3 5.7 3.5 7.7L5 29l7-3c1.3.4 2.6.5 4 .5 7 0 13-4.5 13-11S23 4 16 4z"/><circle cx="10.5" cy="15" r="1.2" class="fill"/><circle cx="16" cy="15" r="1.2" class="fill"/><circle cx="21.5" cy="15" r="1.2" class="fill"/></svg>
+        <span>Feedback</span>
+      </button>
+    </div>
+
+    <div class="detail" id="detail">
+      <div class="empty">Select a family or a variable in the tree.</div>
+    </div>
+  </main>
+</div>
+
+<!-- ============ Modal ============ -->
+<div class="overlay" id="overlay" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal-head"><span id="modalTitle"></span><button class="modal-x" id="modalX" aria-label="Close">×</button></div>
+    <div class="modal-body" id="modalBody"></div>
+    <div class="modal-foot">
+      <span class="modal-err" id="modalErr"></span>
+      <button class="btn" id="modalCancel">Cancel</button>
+      <button class="btn primary" id="modalOk">OK</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
