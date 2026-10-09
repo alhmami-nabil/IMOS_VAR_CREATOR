@@ -620,6 +620,11 @@ def rename(kind, rid):
             elif m["id"] == m["name"] and key(r.get("parent", r.get("family"))) == key(rid):
                 _set_parent(r, name)
     patch_tree(current_db(), ren)
+    if tv_has_table():                        # value sets follow the new name
+        extra, ep = _tv_stamp()
+        c2 = get_db().cursor()
+        c2.execute(f"UPDATE {q(TV['table'])} SET {q(TV['var'])} = ?{extra} WHERE {q(TV['var'])} = ?", [name] + ep + [rid])
+        get_db().commit()
     return jsonify(ok=True, id=new_id)
 
 
@@ -703,6 +708,11 @@ def delete(kind, rid):
         cur.execute(f"DELETE FROM {q(config.TABLE)} WHERE LTRIM(RTRIM(CAST({q(m['id'])} AS NVARCHAR(4000)))) "
                     f"IN ({','.join('?' * len(chunk))})", chunk)
     db.commit()
+    if tv_has_table():                        # their value-set rows go too
+        c2 = get_db().cursor()
+        for chunk in _in_chunks(ids):
+            c2.execute(f"DELETE FROM {q(TV['table'])} WHERE {q(TV['var'])} IN ({','.join('?' * len(chunk))})", chunk)
+        get_db().commit()
     gone = {key(i) for i in ids}
     patch_tree(current_db(), lambda data: data.__setitem__(slice(None), [r for r in data if key(r.get("id")) not in gone]))
     return jsonify(ok=True, deleted=len(ids))
@@ -751,6 +761,318 @@ def insert_row(name, typ, parent, category="", notes=""):
         data.append(r)
     patch_tree(current_db(), add)
     return name
+
+
+# ================================================================== value sets (TRANSVAR table)
+# One row per value:  CODEWERT = value set name,  FUER_VAR = variable / sub-family of the family,
+#                     IMOSWERT = value in this set,  TYP = type of FUER_VAR.
+# No row = the variable keeps its own default value, shown as  <default> (←)  like in IMOS.
+TV = {"table": "TRANSVAR", "set": "CODEWERT", "value": "IMOSWERT", "var": "FUER_VAR", "type": "TYP"}
+TV.update(getattr(config, "TRANSVAR", {}))
+_TV_SCHEMA = {}
+_NUMERIC = {"int", "bigint", "smallint", "tinyint", "bit", "decimal", "numeric", "float", "real", "money", "smallmoney"}
+
+
+def tv_schema():
+    """Columns of TRANSVAR in the current database: name -> (nullable, data type, max length)."""
+    k = current_db().lower()
+    if k not in _TV_SCHEMA:
+        schema, _, table = TV["table"].rpartition(".")
+        data = rows("SELECT COLUMN_NAME AS c, IS_NULLABLE AS n, DATA_TYPE AS t, CHARACTER_MAXIMUM_LENGTH AS l "
+                    "FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND TABLE_SCHEMA = ? ORDER BY ORDINAL_POSITION",
+                    [table, schema or "dbo"])
+        if not data:
+            abort(400, description=f"The table {TV['table']} doesn't exist in {current_db()}.")
+        _TV_SCHEMA[k] = {r["c"]: (r["n"] == "YES", (r["t"] or "").lower(), int(r["l"]) if r["l"] and int(r["l"]) > 0 else None)
+                         for r in data}
+    return _TV_SCHEMA[k]
+
+
+def tv_has_table():
+    try:
+        tv_schema()
+        return True
+    except Exception:
+        return False
+
+
+def tv_check_len(col, value, label):
+    lim = tv_schema().get(col, (True, "", None))[2]
+    if lim and len(value) > lim:
+        abort(400, description=f"{label} is too long: {len(value)} characters (maximum {lim}).")
+
+
+def family_children(fid):
+    """Direct content of a family: sub-families first, then variables, in IMOS order."""
+    m = mapping()
+    data = rows(f"SELECT {q(m['name'])} AS name, {q(m['type'])} AS typ, "
+                f"{q(m['default']) if m['default'] else 'NULL'} AS wert FROM {q(config.TABLE)} WITH (NOLOCK) "
+                f"WHERE {q(m['parent'])} = ?", [fid])
+    fams = {key(x) for x in config.FAMILY_TYPES}
+    out = [{"name": sid(r["name"]), "type": sid(r["typ"]), "type_label": type_label(r["typ"]),
+            "kind": "family" if key(r["typ"]) in fams else "variable", "default": sid(r["wert"])} for r in data]
+    for c in out:           # every row can get a value; numbers and texts are typed in a text field
+        c["editable"] = True
+        c["free"] = c["kind"] == "variable" and c["type"] in ("100", "120")
+    out.sort(key=lambda c: (c["kind"] != "family", name_order(c["name"])))
+    return out
+
+
+def _in_chunks(values, size=500):
+    for i in range(0, len(values), size):
+        yield values[i:i + size]
+
+
+@app.get("/api/valuesets/<path:fid>")
+def get_valuesets(fid):
+    m = mapping()
+    children = family_children(fid)
+    names = [c["name"] for c in children]
+    sets = {}
+    if names and tv_has_table():
+        for chunk in _in_chunks(names):
+            for r in rows(f"SELECT {q(TV['set'])} AS s, {q(TV['var'])} AS v, {q(TV['value'])} AS w "
+                          f"FROM {q(TV['table'])} WITH (NOLOCK) WHERE {q(TV['var'])} IN ({','.join('?' * len(chunk))})", chunk):
+                sname = sid(r["s"])
+                if sname:
+                    sets.setdefault(sname, {})[sid(r["v"])] = sid(r["w"])
+        # for a sub-family, the choices are the value sets of that sub-family
+        subfams = [c["name"] for c in children if c["kind"] == "family"]
+        opts = {}
+        for chunk in _in_chunks(subfams):
+            for r in rows(f"SELECT DISTINCT i.{q(m['parent'])} AS f, t.{q(TV['set'])} AS s "
+                          f"FROM {q(TV['table'])} t WITH (NOLOCK) JOIN {q(config.TABLE)} i WITH (NOLOCK) "
+                          f"ON i.{q(m['name'])} = t.{q(TV['var'])} "
+                          f"WHERE i.{q(m['parent'])} IN ({','.join('?' * len(chunk))})", chunk):
+                opts.setdefault(key(r["f"]), set()).add(sid(r["s"]))
+        for c in children:
+            if c["kind"] == "family":
+                c["options"] = sorted(opts.get(key(c["name"]), set()) - {""}, key=name_order)
+    # first value set = the default: its name is the WERT of the family row, its values the WERT of each child
+    first_name = ""
+    if m["default"]:
+        fr = rows(f"SELECT {q(m['default'])} AS w FROM {q(config.TABLE)} WITH (NOLOCK) WHERE {q(m['name'])} = ?", [fid])
+        first_name = sid(fr[0]["w"]) if fr else ""
+    out = []
+    if first_name:
+        out.append({"name": first_name, "first": True,
+                    "values": {c["name"]: c["default"] for c in children if c["default"]}})
+    out += [{"name": n, "values": v} for n, v in sorted(sets.items(), key=lambda x: name_order(x[0]))
+            if key(n) != key(first_name)]
+    for c in children:       # a sub-family also offers its own default value set
+        if c["kind"] == "family" and c["default"] and c["default"] not in c.get("options", []):
+            c["options"] = [c["default"]] + c.get("options", [])
+    return jsonify(children=children, sets=out, table_ok=tv_has_table())
+
+
+def _child_or_404(fid, var):
+    c = next((c for c in family_children(fid) if key(c["name"]) == key(var)), None)
+    if not c:
+        abort(400, description=f"{var} is not in the family {fid}. Refresh the tree.")
+    return c
+
+
+def _tv_insert(cur, values):
+    """INSERT one TRANSVAR row; columns we don't know get a neutral value (NULL, 0 or '')."""
+    sch = tv_schema()
+    date_col = getattr(config, "DATE_COLUMN", None)
+    cols, params, marks = [], [], []
+    for col, (nullable, dtype, _l) in sch.items():
+        if col == date_col:
+            cols.append(col); marks.append("GETDATE()"); continue
+        if col in values:
+            v = values[col]
+        elif col == "SOURCE":
+            v = config.SOURCE_USER
+        elif nullable:
+            continue
+        else:
+            v = 0 if dtype in _NUMERIC else ""
+        cols.append(col); marks.append("?"); params.append(v)
+    cur.execute(f"INSERT INTO {q(TV['table'])} ({', '.join(q(c) for c in cols)}) VALUES ({', '.join(marks)})", params)
+
+
+def _tv_stamp():
+    sch = tv_schema()
+    parts, params = [], []
+    date_col = getattr(config, "DATE_COLUMN", None)
+    if date_col in sch:
+        parts.append(f"{q(date_col)} = GETDATE()")
+    if "SOURCE" in sch:
+        parts.append(f"{q('SOURCE')} = ?"); params.append(config.SOURCE_USER)
+    return (", " + ", ".join(parts)) if parts else "", params
+
+
+@app.post("/api/valuesets/<path:fid>/value")
+def set_value(fid):
+    """Set (or clear) the value of one variable in one value set."""
+    guard_write()
+    d = request.get_json(force=True)
+    sname, var, value = (d.get("set") or "").strip(), (d.get("var") or "").strip(), (d.get("value") or "").strip()
+    if not sname:
+        abort(400, description="The value set has no name.")
+    c = _child_or_404(fid, var)
+    if not c["editable"]:
+        abort(400, description=f"{c['type_label']} variables can't be set in a value set.")
+    if d.get("first"):                        # default value set = WERT of the variable in IMOS
+        m = mapping()
+        if not m["default"]:
+            abort(400, description="No default value column (WERT) in the IMOS table.")
+        check_length("default", value)
+        db = get_db()
+        db.cursor().execute(f"UPDATE {q(config.TABLE)} SET {q(m['default'])} = ?{stamp()} WHERE {q(m['name'])} = ?",
+                            [value, c["name"]])
+        db.commit()
+        return jsonify(ok=True)
+    tv_check_len(TV["set"], sname, "Value set name")
+    tv_check_len(TV["value"], value, "Value")
+    db = get_db(); cur = db.cursor()
+    where = f"{q(TV['set'])} = ? AND {q(TV['var'])} = ?"
+    if not value:
+        cur.execute(f"DELETE FROM {q(TV['table'])} WHERE {where}", [sname, c["name"]])
+    else:
+        cur.execute(f"SELECT COUNT(*) FROM {q(TV['table'])} WHERE {where}", [sname, c["name"]])
+        if cur.fetchone()[0]:
+            extra, ep = _tv_stamp()
+            cur.execute(f"UPDATE {q(TV['table'])} SET {q(TV['value'])} = ?{extra} WHERE {where}", [value] + ep + [sname, c["name"]])
+        else:
+            _tv_insert(cur, {TV["type"]: int(float(c["type"])) if c["type"] else 0, TV["set"]: sname,
+                             TV["value"]: value, TV["var"]: c["name"]})
+    db.commit()
+    return jsonify(ok=True)
+
+
+def _first_set_name(fid):
+    m = mapping()
+    if not m["default"]:
+        return ""
+    r = rows(f"SELECT {q(m['default'])} AS w FROM {q(config.TABLE)} WITH (NOLOCK) WHERE {q(m['name'])} = ?", [fid])
+    return sid(r[0]["w"]) if r else ""
+
+
+@app.post("/api/valuesets/<path:fid>/first")
+def create_first_set(fid):
+    """The first value set of a family: its name is written in the WERT of the family row."""
+    guard_write()
+    name = (request.get_json(force=True).get("name") or "").strip()
+    if not name:
+        abort(400, description="Enter a name for the value set.")
+    if _first_set_name(fid):
+        abort(400, description="This family already has its first value set.")
+    m = mapping()
+    check_length("default", name)
+    db = get_db()
+    db.cursor().execute(f"UPDATE {q(config.TABLE)} SET {q(m['default'])} = ?{stamp()} WHERE {q(m['name'])} = ?", [name, fid])
+    db.commit()
+    return jsonify(ok=True)
+
+
+def _set_rows_where(fid):
+    names = [c["name"] for c in family_children(fid)]
+    if not names:
+        abort(400, description="This family is empty.")
+    return names
+
+
+@app.post("/api/valuesets/<path:fid>/rename")
+def rename_set(fid):
+    guard_write()
+    d = request.get_json(force=True)
+    old, new = (d.get("old") or "").strip(), (d.get("new") or "").strip()
+    if not new:
+        abort(400, description="Enter a name for the value set.")
+    first = _first_set_name(fid)
+    if first and key(new) == key(first) and key(old) != key(first):
+        abort(400, description=f"The value set {new} already exists in this family.")
+    if first and key(old) == key(first):      # rename the default set = WERT of the family row
+        m = mapping()
+        check_length("default", new)
+        db = get_db(); cur = db.cursor()
+        cur.execute(f"UPDATE {q(config.TABLE)} SET {q(m['default'])} = ?{stamp()} WHERE {q(m['name'])} = ?", [new, fid])
+        if tv_has_table():                    # a parent family that points to it follows the new name
+            extra, ep = _tv_stamp()
+            cur.execute(f"UPDATE {q(TV['table'])} SET {q(TV['value'])} = ?{extra} "
+                        f"WHERE {q(TV['var'])} = ? AND {q(TV['value'])} = ?", [new] + ep + [fid, old])
+        db.commit()
+        return jsonify(ok=True)
+    tv_check_len(TV["set"], new, "Value set name")
+    names = _set_rows_where(fid)
+    db = get_db(); cur = db.cursor()
+    for chunk in _in_chunks(names):
+        marks = ",".join("?" * len(chunk))
+        cur.execute(f"SELECT COUNT(*) FROM {q(TV['table'])} WHERE {q(TV['set'])} = ? AND {q(TV['var'])} IN ({marks})", [new] + chunk)
+        if cur.fetchone()[0] and key(new) != key(old):
+            abort(400, description=f"The value set {new} already exists in this family.")
+    extra, ep = _tv_stamp()
+    for chunk in _in_chunks(names):
+        marks = ",".join("?" * len(chunk))
+        cur.execute(f"UPDATE {q(TV['table'])} SET {q(TV['set'])} = ?{extra} "
+                    f"WHERE {q(TV['set'])} = ? AND {q(TV['var'])} IN ({marks})", [new] + ep + [old] + chunk)
+    # a parent family that points to this value set follows the new name
+    cur.execute(f"UPDATE {q(TV['table'])} SET {q(TV['value'])} = ?{extra} "
+                f"WHERE {q(TV['var'])} = ? AND {q(TV['value'])} = ?", [new] + ep + [fid, old])
+    db.commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/valuesets/<path:fid>/delete")
+def delete_set(fid):
+    guard_write()
+    sname = (request.get_json(force=True).get("set") or "").strip()
+    if sname and key(sname) == key(_first_set_name(fid)):
+        # first (default) set: only its name is removed (WERT of the family row = '').
+        # The variables keep their own Default Value (their WERT is not touched).
+        m = mapping()
+        db = get_db(); cur = db.cursor()
+        cur.execute(f"UPDATE {q(config.TABLE)} SET {q(m['default'])} = ?{stamp()} WHERE {q(m['name'])} = ?", ["", fid])
+        if tv_has_table():                    # a parent family that pointed to this set goes back to <> (←)
+            cur.execute(f"DELETE FROM {q(TV['table'])} WHERE {q(TV['var'])} = ? AND {q(TV['value'])} = ?", [fid, sname])
+        db.commit()
+        return jsonify(ok=True)
+    names = _set_rows_where(fid)
+    db = get_db(); cur = db.cursor()
+    for chunk in _in_chunks(names):
+        cur.execute(f"DELETE FROM {q(TV['table'])} WHERE {q(TV['set'])} = ? "
+                    f"AND {q(TV['var'])} IN ({','.join('?' * len(chunk))})", [sname] + chunk)
+    db.commit()
+    return jsonify(ok=True)
+
+
+@app.post("/api/valuesets/<path:fid>/duplicate")
+def duplicate_set(fid):
+    guard_write()
+    d = request.get_json(force=True)
+    src, new = (d.get("set") or "").strip(), (d.get("new") or "").strip()
+    if not new:
+        abort(400, description="Enter a name for the new value set.")
+    tv_check_len(TV["set"], new, "Value set name")
+    names = _set_rows_where(fid)
+    db = get_db(); cur = db.cursor()
+    originals = []
+    for chunk in _in_chunks(names):
+        marks = ",".join("?" * len(chunk))
+        cur.execute(f"SELECT COUNT(*) FROM {q(TV['table'])} WHERE {q(TV['set'])} = ? AND {q(TV['var'])} IN ({marks})", [new] + chunk)
+        if cur.fetchone()[0]:
+            abort(400, description=f"The value set {new} already exists in this family.")
+        if key(new) == key(_first_set_name(fid)):
+            abort(400, description=f"The value set {new} already exists in this family.")
+        if key(src) == key(_first_set_name(fid)):
+            continue                          # taken from IMOS below
+        cur.execute(f"SELECT * FROM {q(TV['table'])} WHERE {q(TV['set'])} = ? AND {q(TV['var'])} IN ({marks})", [src] + chunk)
+        cols = [x[0] for x in cur.description]
+        originals += [dict(zip(cols, r)) for r in cur.fetchall()]
+    if key(src) == key(_first_set_name(fid)):
+        originals = [{TV["type"]: int(float(c["type"])) if c["type"] else 0, TV["var"]: c["name"], TV["value"]: c["default"]}
+                     for c in family_children(fid) if c["default"] and c["editable"]]
+    date_col = getattr(config, "DATE_COLUMN", None)
+    for r in originals:
+        r = {k: v for k, v in r.items() if k != date_col}
+        r[TV["set"]] = new
+        if "SOURCE" in r:
+            r["SOURCE"] = config.SOURCE_USER
+        _tv_insert(cur, r)
+    db.commit()
+    return jsonify(ok=True, copied=len(originals))
 
 
 @app.post("/api/copy")

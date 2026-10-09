@@ -312,8 +312,9 @@ async function renderDetail() {
         <div class="grid-head"><div>Name</div><div>Value</div></div>
         ${sectionHead("basic", "Basic data")}
         ${state.sections.basic ? basic : ""}
-        ${rawSection(d.raw)}
+        <div id="vsBox"></div>
       </div>`;
+    loadValueSets(f.id);
     return;
   }
   const v = d.variable, ro = state.meta.read_only, dis = ro ? " disabled" : "";
@@ -674,6 +675,274 @@ $("#tree").addEventListener("drop", async e => {
     onOk: () => doMove(item.kind, item.id, target)});
 });
 
+/* ------------------------------------------------------------ value sets (family) */
+(() => {
+  const st = document.createElement("style");
+  st.textContent = `
+    .vs-head{justify-content:flex-start}
+    .vs-tools{margin-left:auto;display:flex;gap:4px;padding-right:4px}
+    .vs-tools button{width:28px;height:26px;border:0;background:none;border-radius:4px;color:var(--text);display:flex;align-items:center;justify-content:center}
+    .vs-tools button:hover{background:var(--toolbar);color:var(--accent)}
+    .vs-tools svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:2}
+    .vs-table{margin:0 0 10px 18px}
+    .vs-th{background:var(--head-bg);color:var(--head-text);font-weight:600;font-size:12px;height:26px;display:flex;align-items:center;padding-left:28px}
+    .vs-sethead{display:flex;align-items:center;gap:8px;height:28px;background:var(--toolbar);border-bottom:1px solid var(--panel-line);padding:0 4px 0 6px;font-size:13px;color:var(--text)}
+    .vs-sethead .tog{width:18px;height:18px;border:0;background:none;color:var(--accent);font-weight:700;font-size:16px;line-height:1;padding:0}
+    .vs-sethead .nm{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .vs-sethead .nm i{font-style:normal;color:var(--muted);font-size:12px;margin-left:6px}
+    .vs-sethead .menu{width:28px;height:24px;border:0;background:none;border-radius:4px;color:var(--text);font-size:16px}
+    .vs-sethead .menu:hover{background:#e2e8f0}
+    .vs-row{display:flex;align-items:center;min-height:26px;border-bottom:1px solid var(--panel-line)}
+    .vs-row .k{width:45%;max-width:302px;flex:none;padding:0 8px 0 24px;font-size:12px;color:var(--label);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .vs-row .v{flex:1;display:flex;min-width:0}
+    .vs-row select{flex:1;min-width:0;border:1px solid var(--field-line);height:24px;padding:0 26px 0 10px;font:inherit;font-size:12px;color:var(--text);border-radius:3px;
+      appearance:none;background:var(--field) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23475569' stroke-width='1.3'/%3E%3C/svg%3E") no-repeat right 8px center/10px}
+    .vs-row select:focus{outline:none;border-color:var(--accent)}
+    .vs-row input.vs-in{flex:1;min-width:0;border:1px solid var(--field-line);height:24px;padding:0 10px;font:inherit;font-size:12px;
+      color:var(--text);background:var(--field);border-radius:3px}
+    .vs-row input.vs-in::placeholder{color:var(--muted)}
+    .vs-row input.vs-in:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 2px var(--accent-soft)}
+    .vs-row select.inh{color:var(--muted)}
+    .vs-row .ro{flex:1;min-width:0;background:var(--ro);border:1px solid var(--field-line);height:24px;padding:3px 10px;font-size:12px;color:var(--disabled);border-radius:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+    .vs-empty{padding:8px 28px;font-size:12px;color:var(--muted)}
+    .vs-pop{position:fixed;z-index:30;background:var(--page);border:1px solid var(--panel-line);border-radius:6px;box-shadow:0 8px 24px rgba(15,23,42,.2);padding:4px;min-width:150px}
+    .vs-pop button{display:block;width:100%;text-align:left;border:0;background:none;padding:7px 12px;border-radius:4px;font-size:13px;color:var(--text)}
+    .vs-pop button:hover{background:var(--accent-soft);color:var(--accent-text)}
+    .vs-pop button.danger{color:var(--danger)}`;
+  document.head.appendChild(st);
+})();
+
+const VS = {fid: null, data: null, open: new Set(), catalog: {}};
+const ADD_SVG = `<svg viewBox="0 0 16 16"><path d="M8 2v12M2 8h12"/></svg>`;
+const EXPAND_SVG = `<svg viewBox="0 0 16 16"><rect x="2" y="2" width="12" height="12" rx="1"/><path d="M6 10l4-4M7 6h3v3"/></svg>`;
+
+async function loadValueSets(fid) {
+  const box = $("#vsBox"); if (!box) return;
+  if (VS.fid !== fid) { VS.fid = fid; VS.data = null; VS.open = new Set(); }
+  if (!VS.data) {
+    box.innerHTML = "";
+    try { VS.data = await api(`/api/valuesets/${encodeURIComponent(fid)}`); }
+    catch (e) { box.innerHTML = sectionHead("vs", "Value sets") + `<div class="vs-empty" style="color:var(--danger)">${esc(e.message)}</div>`; return; }
+    if (state.sel.kind !== "family" || state.sel.id !== fid) return;
+    VS.data.sets.forEach(s => VS.open.add(s.name));
+    // the lists of values, one per type (same lists as Default Value)
+    const types = [...new Set(VS.data.children.filter(c => c.kind === "variable" && c.editable).map(c => c.type))];
+    await Promise.all(types.filter(t => !VS.catalog[currentDb + "|" + t]).map(async t => {
+      try { VS.catalog[currentDb + "|" + t] = (await api(`/api/catalog?type=${encodeURIComponent(t)}`)).map(o => o.code); }
+      catch { VS.catalog[currentDb + "|" + t] = []; }
+    }));
+  }
+  renderValueSets();
+}
+
+function vsChoices(c) {
+  return c.kind === "family" ? (c.options || []) : (VS.catalog[currentDb + "|" + c.type] || []);
+}
+
+function renderValueSets() {
+  const box = $("#vsBox"); if (!box || !VS.data) return;
+  // like IMOS: an empty family (no sub-family, no variable) has no Value sets section
+  if (!VS.data.children.length) { box.innerHTML = ""; return; }
+  const ro = state.meta.read_only, open = state.sections.vs !== false;
+  const tools = ro ? "" : `<span class="vs-tools">
+      <button data-vs="add" title="New value set">${ADD_SVG}</button>
+      <button data-vs="expand" title="Open / close all value sets">${EXPAND_SVG}</button></span>`;
+  let html = `<div class="section vs-head${open ? " open" : ""}" data-sec="vs">${CHEV}<span>Value sets</span>${tools}</div>`;
+  if (open) {
+    const {children, sets} = VS.data;
+    html += `<div class="vs-table"><div class="vs-th">Name of value sets</div>`;
+    if (!sets.length) html += `<div class="vs-empty">No value set yet${ro ? "." : " – click + to add one."}</div>`;
+    for (const set of sets) {
+      const isOpen = VS.open.has(set.name);
+      html += `<div class="vs-set" data-set="${esc(set.name)}">
+        <div class="vs-sethead"><button class="tog" data-vs="toggle" title="${isOpen ? "Close" : "Open"}">${isOpen ? "−" : "+"}</button>
+          <span class="nm">${esc(set.name)}${set.local ? "<i>not saved yet – choose a value to save it</i>" : ""}</span>
+          ${ro ? "" : `<button class="menu" data-vs="menu" title="Rename, duplicate or delete">☰</button>`}</div>`;
+      if (isOpen) {
+        if (!children.length) html += `<div class="vs-empty">This family is empty.</div>`;
+        for (const c of children) {
+          const label = `${c.name} (${c.kind === "family" ? "Family" : c.type_label})`;
+          const cur = set.values[c.name] || "";
+          // first set: no value = empty WERT; other sets: no value = the default (first set) value
+          const inherit = set.first ? "<> (←)" : `<${c.default}> (←)`;
+          let cell;
+          if (!c.editable || ro) {
+            const shown = !c.editable ? `<${c.default}> (←)` : (cur && !set.first ? cur : (cur ? cur : inherit));
+            cell = `<div class="ro" title="${esc(shown)}">${esc(shown)}</div>`;
+          } else if (c.free) {
+            cell = `<input class="vs-in" data-var="${esc(c.name)}" value="${esc(cur)}" placeholder="${esc(set.first ? "<> (←)" : inherit)}"
+                      title="${esc(cur || (set.first ? "" : inherit))}" spellcheck="false" autocomplete="off"
+                      maxlength="${(state.meta.limits || {}).default || 4000}">`;
+          } else {
+            const choices = vsChoices(c);
+            const list = cur && !choices.includes(cur) ? [cur, ...choices] : choices;
+            cell = `<select data-var="${esc(c.name)}" class="${cur ? "" : "inh"}">
+                <option value="">${esc(inherit)}</option>
+                ${list.map(o => `<option value="${esc(o)}"${o === cur ? " selected" : ""}>${esc(o)}</option>`).join("")}
+              </select><button class="dots" data-vs="pick" data-var="${esc(c.name)}" title="Browse values">...</button>`;
+          }
+          html += `<div class="vs-row"><div class="k" title="${esc(label)}">${esc(label)}</div><div class="v">${cell}</div></div>`;
+        }
+      }
+      html += `</div>`;
+    }
+    html += `</div>`;
+  }
+  // keep the cursor in the field you were in (Tab to the next row keeps working after a save)
+  const a = document.activeElement, keep = a && box.contains(a) && a.dataset.var
+    ? {set: a.closest("[data-set]")?.dataset.set, v: a.dataset.var, tag: a.tagName} : null;
+  box.innerHTML = html;
+  if (keep) {
+    const again = [...box.querySelectorAll(`[data-var]`)].find(x =>
+      x.dataset.var === keep.v && x.tagName === keep.tag && x.closest("[data-set]")?.dataset.set === keep.set);
+    if (again) again.focus();
+  }
+}
+
+async function vsSetValue(setName, varName, value) {
+  const set = VS.data.sets.find(s => s.name === setName);
+  try {
+    await api(`/api/valuesets/${encodeURIComponent(VS.fid)}/value`, {method: "POST",
+      body: {set: setName, var: varName, value, first: !!set.first}});
+    if (value) set.values[varName] = value; else delete set.values[varName];
+    if (set.first) {                          // the default value changed: the other sets show it as <value> (←)
+      const c = VS.data.children.find(x => x.name === varName);
+      if (c) c.default = value;
+    }
+    set.local = false;
+    toast(value ? `${setName}: ${varName} = ${value}` : `${setName}: ${varName} back to its default`);
+  } catch (e) { toast(e.message, true); }
+  renderValueSets();
+}
+
+function vsUniqueName(base) {
+  const used = new Set(VS.data.sets.map(s => s.name.toUpperCase()));
+  if (!used.has(base.toUpperCase())) return base;
+  let i = 1; while (used.has(`${base}_${i}`.toUpperCase())) i++;
+  return `${base}_${i}`;
+}
+
+function vsAskName(title, value, okText, onOk) {
+  modal({title, okText, body: `<label>Name of the value set</label><input id="mVs" value="${esc(value)}">`,
+    onOk: async () => {
+      const n = $("#mVs").value.trim();
+      if (!n) throw new Error("Enter a name.");
+      if (/['"]/.test(n)) throw new Error("No quotes in the name.");
+      await onOk(n);
+    }});
+}
+
+function vsMenu(btn, setName) {
+  document.querySelectorAll(".vs-pop").forEach(p => p.remove());
+  const r = btn.getBoundingClientRect(), pop = document.createElement("div");
+  pop.className = "vs-pop";
+  const isFirst = !!(VS.data.sets.find(x => x.name === setName) || {}).first;
+  pop.innerHTML = `<button data-a="rename">Rename</button><button data-a="dup">Duplicate</button>` +
+    `<button data-a="del" class="danger">Delete</button>`;
+  pop.style.top = (r.bottom + 4) + "px"; pop.style.left = Math.max(8, r.right - 160) + "px";
+  document.body.appendChild(pop);
+  const close = () => { pop.remove(); document.removeEventListener("mousedown", out, true); };
+  const out = e => { if (!pop.contains(e.target)) close(); };
+  setTimeout(() => document.addEventListener("mousedown", out, true));
+  pop.onclick = e => {
+    const a = e.target.closest("[data-a]")?.dataset.a; if (!a) return;
+    close();
+    const set = VS.data.sets.find(s => s.name === setName);
+    const fidUrl = `/api/valuesets/${encodeURIComponent(VS.fid)}`;
+    if (a === "rename") vsAskName("Rename value set", setName, "Rename", async n => {
+      if (n.toUpperCase() !== setName.toUpperCase() && VS.data.sets.some(s => s.name.toUpperCase() === n.toUpperCase())) throw new Error(`${n} already exists.`);
+      if (!set.local) await api(`${fidUrl}/rename`, {method: "POST", body: {old: setName, new: n}});
+      set.name = n; VS.open.delete(setName); VS.open.add(n); renderValueSets(); toast("Value set renamed");
+    });
+    if (a === "dup") vsAskName("Duplicate value set", vsUniqueName(setName + "_COPY"), "Duplicate", async n => {
+      if (VS.data.sets.some(s => s.name.toUpperCase() === n.toUpperCase())) throw new Error(`${n} already exists.`);
+      if (!set.local) await api(`${fidUrl}/duplicate`, {method: "POST", body: {set: setName, new: n}});
+      VS.data.sets.push({name: n, values: {...set.values}, local: set.local || !Object.keys(set.values).length});
+      VS.data.sets.sort((a, b) => (b.first ? 1 : 0) - (a.first ? 1 : 0) || a.name.localeCompare(b.name));
+      VS.open.add(n); renderValueSets(); toast("Value set duplicated");
+    });
+    if (a === "del") modal({title: "Delete value set", okText: "Delete",
+      body: set.first
+        ? `<p style="margin:0 0 8px">Delete the default value set <b>${esc(setName)}</b> of <b>${esc(VS.fid)}</b>?</p>
+           <p style="margin:0;color:var(--muted);font-size:12px;line-height:1.5">Only the name of the set is removed (WERT of the family).
+           The variables keep their own Default Value. The next <b>+</b> creates a new default set.</p>`
+        : `<p style="margin:0">Delete the value set <b>${esc(setName)}</b> of <b>${esc(VS.fid)}</b>?</p>`,
+      onOk: async () => {
+        if (!set.local) await api(`${fidUrl}/delete`, {method: "POST", body: {set: setName}});
+        VS.data.sets = VS.data.sets.filter(s => s !== set); renderValueSets(); toast("Value set deleted");
+      }});
+  };
+}
+
+function vsPick(setName, varName) {
+  const c = VS.data.children.find(x => x.name === varName);
+  const set = VS.data.sets.find(s => s.name === setName);
+  let chosen = set.values[varName] || "";
+  const all = vsChoices(c);
+  modal({title: `${setName} – ${varName}`, okText: "Use value",
+    body: `<input id="mQ" placeholder="Filter values"><div class="pick-list" id="mList"></div>`,
+    onOk: async () => { await vsSetValue(setName, varName, chosen); }});
+  const draw = () => {
+    const f = $("#mQ").value.toLowerCase();
+    const list = all.filter(x => !f || x.toLowerCase().includes(f));
+    $("#mList").innerHTML = `<div data-code="" class="${chosen === "" ? "on" : ""}"><b>&lt;${esc(set.first ? "" : c.default)}&gt; (←)</b>${set.first ? "empty" : "default"}</div>` +
+      list.map(x => `<div data-code="${esc(x)}" class="${x === chosen ? "on" : ""}"><b>${esc(x)}</b></div>`).join("");
+    $("#modalErr").innerHTML = `<span style="color:var(--muted)">${list.length} value${list.length === 1 ? "" : "s"}</span>`;
+  };
+  $("#mQ").oninput = draw;
+  $("#mList").onclick = e => { const d = e.target.closest("[data-code]"); if (!d) return; chosen = d.dataset.code; draw(); };
+  $("#mList").ondblclick = e => { if (e.target.closest("[data-code]")) $("#modalOk").click(); };
+  draw();
+}
+
+/* clicks and changes inside the Value sets section */
+document.addEventListener("click", e => {
+  const b = e.target.closest("#vsBox [data-vs]"); if (!b) return;
+  e.stopPropagation();
+  const setEl = b.closest("[data-set]"), setName = setEl ? setEl.dataset.set : null;
+  const a = b.dataset.vs;
+  if (a === "add") {
+    state.sections.vs = true;
+    const hasFirst = VS.data.sets.some(x => x.first);
+    const n = vsUniqueName("New");
+    (async () => {
+      try {
+        if (!hasFirst) {                      // first set = default values: its name goes into the WERT of the family
+          await api(`/api/valuesets/${encodeURIComponent(VS.fid)}/first`, {method: "POST", body: {name: n}});
+          const values = {};
+          VS.data.children.forEach(c => { if (c.default) values[c.name] = c.default; });
+          VS.data.sets.unshift({name: n, values, first: true});
+        } else {
+          VS.data.sets.push({name: n, values: {}, local: true});
+        }
+        VS.open.add(n); renderValueSets();
+        toast(`Value set ${n} added – ☰ to rename it`);
+      } catch (e) { toast(e.message, true); }
+    })();
+  }
+  if (a === "expand") {
+    const allOpen = VS.data.sets.every(s => VS.open.has(s.name));
+    VS.open = allOpen ? new Set() : new Set(VS.data.sets.map(s => s.name)); renderValueSets();
+  }
+  if (a === "toggle") { VS.open.has(setName) ? VS.open.delete(setName) : VS.open.add(setName); renderValueSets(); }
+  if (a === "menu") vsMenu(b, setName);
+  if (a === "pick") vsPick(setName, b.dataset.var);
+}, true);
+document.addEventListener("change", e => {
+  const el = e.target.closest("#vsBox select[data-var], #vsBox input.vs-in"); if (!el) return;
+  const setName = el.closest("[data-set]").dataset.set, set = VS.data.sets.find(x => x.name === setName);
+  if (el.tagName === "INPUT" && (set.values[el.dataset.var] || "") === el.value.trim()) return;   // nothing changed
+  vsSetValue(setName, el.dataset.var, el.value.trim());
+});
+document.addEventListener("keydown", e => {
+  const el = e.target.closest("#vsBox input.vs-in"); if (!el) return;
+  if (e.key === "Enter") { e.preventDefault(); el.blur(); }                       // blur -> change -> saved
+  if (e.key === "Escape") {                                                      // put the saved value back
+    const set = VS.data.sets.find(x => x.name === el.closest("[data-set]").dataset.set);
+    el.value = set.values[el.dataset.var] || ""; el.blur();
+  }
+});
+
 /* ------------------------------------------------------------ title: type a new name + Add */
 (() => {
   const st = document.createElement("style");
@@ -895,6 +1164,7 @@ $("#tree").addEventListener("keydown", e => {
 
 $("#detail").addEventListener("click", e => {
   const s = e.target.closest(".section");
+  if (s && s.dataset.sec === "vs") { state.sections.vs = state.sections.vs === false; renderValueSets(); return; }
   if (s) { syncDraft(); state.sections[s.dataset.sec] = !state.sections[s.dataset.sec]; renderDetail(); return; }
   if (e.target.id === "btnPick") pickValue();
 });
@@ -929,6 +1199,7 @@ $("#btnRefresh").onclick = async () => {
   if (!(await confirmLeave())) return; setDirty(false);
   $("#btnRefresh").classList.add("busy");
   try { state.meta = await api("/api/meta?refresh=1"); } catch {}
+  VS.fid = null; VS.catalog = {};
   const ok = await loadTree(true);
   $("#btnRefresh").classList.remove("busy");
   if (!ok) return;
@@ -997,7 +1268,7 @@ async function openDatabase() {
 $("#dbSelect").addEventListener("change", async e => {
   const next = e.target.value;
   if (!(await confirmLeave())) { e.target.value = currentDb; return; }
-  currentDb = next;
+  currentDb = next; VS.fid = null; VS.catalog = {};
   try { localStorage.setItem("imos_db", next); } catch {}
   setDirty(false);
   state.sel = {kind: "root", id: null}; state.detail = null;
